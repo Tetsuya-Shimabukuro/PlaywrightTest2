@@ -1,0 +1,127 @@
+version: 0.2
+
+# ============================================================
+# 予約サイト フッターリンク死活監視（Playwright）
+#
+# - テスト結果（成功/失敗どちらでも）を必ず S3 へアップロードする
+# - 失敗時は Slack に通知し、CodeBuild も失敗させる
+# - PlaywrightTest1 と異なり、Claude Code による原因調査は行わない
+# ============================================================
+
+env:
+  variables:
+    CI: "true"
+  secrets-manager:
+    SLACK_WEBHOOK_URL: "playwright/slack:SLACK_WEBHOOK_URL"
+
+phases:
+  install:
+    commands:
+      - npm ci
+      - npx playwright install chromium
+
+  build:
+    commands:
+      # 失敗判定は、フェーズをまたいだシェル変数の伝播に依存すると挙動が不確実なため、
+      # マーカーファイルの有無で判定する（ファイルは同一コンテナ内で確実に引き継がれる）。
+      # テストが失敗しても build フェーズは止めず、post_build で S3 アップロード後に失敗させる。
+      #
+      # PlaywrightTest1 と同じく、テストごとに --output（テスト成果物の出力先）と
+      # PLAYWRIGHT_HTML_REPORT（HTMLレポート出力先）を分離する。
+      # 今後 spec ファイルを追加する場合も、同じ形式で1行ずつ追加すればレポートが上書きされない。
+      - rm -f test1_failed
+      - PLAYWRIGHT_HTML_REPORT=playwright-report/footer-links npx playwright test tests/footer-links.spec.ts --output=test-results/footer-links || touch test1_failed
+
+  post_build:
+    commands:
+
+      # ============================================================
+      # Playwright test result upload
+      # ============================================================
+      - |
+        RESULT_DIR=$(date '+%Y-%m-%d/%H-%M-%S')
+
+        echo "========================================"
+        echo "RESULT_DIR=${RESULT_DIR}"
+        echo "========================================"
+
+        S3_RESULT_TARGETS="s3://dev-playwright-test/footer-link/result/${RESULT_DIR} s3://wall-124231082686/public/playwright-footer-link/result/${RESULT_DIR} s3://wall2-124231082686/public/playwright-footer-link/result/${RESULT_DIR}"
+
+        for S3_TARGET in $S3_RESULT_TARGETS; do
+          echo "=== Upload test-results to ${S3_TARGET}/test-results/ ==="
+
+          # Playwrightのテスト結果（成功/失敗どちらでも）を必ずS3へアップロードするため、
+          # 個々のアップロードが失敗してもスクリプト全体を止めない。
+          aws s3 cp test-results/ \
+            "${S3_TARGET}/test-results/" \
+            --recursive || echo "WARNING: failed to upload test-results to ${S3_TARGET}"
+
+          echo "=== Upload playwright-report to ${S3_TARGET}/playwright-report/ ==="
+
+          aws s3 cp playwright-report/ \
+            "${S3_TARGET}/playwright-report/" \
+            --recursive || echo "WARNING: failed to upload playwright-report to ${S3_TARGET}"
+        done
+
+        REPORT_URL="https://wall.satoyama.work/public/playwright-footer-link/result/${RESULT_DIR}/playwright-report/footer-links/index.html"
+
+        echo "========================================"
+        echo "Playwright Test Report URL"
+        echo "${REPORT_URL}"
+        echo "========================================"
+
+        echo "${REPORT_URL}" > report_url
+
+      # ============================================================
+      # Playwright failure handling
+      # ============================================================
+      - |
+        # buildフェーズで設定したシェル変数は、CodeBuildのフェーズ間で確実に引き継がれる
+        # 保証がないため使わず、buildフェーズが作成したマーカーファイルの有無で失敗判定を行う。
+        if [ -f test1_failed ]; then
+
+          echo "========================================"
+          echo "Footer link monitor: Playwright tests failed."
+          echo "========================================"
+
+          REPORT_URL=$(cat report_url 2>/dev/null)
+
+          echo "============================================================"
+          echo "Slack notification (Playwrightテスト失敗時のみ通知)"
+          echo "============================================================"
+
+          SLACK_MESSAGE=$(printf ':x: 予約サイトのフッターリンク死活監視でNGがありました\n- tests/footer-links.spec.ts : %s' "${REPORT_URL}")
+
+          SLACK_PAYLOAD=$(printf '%s' "${SLACK_MESSAGE}" | jq -Rs '{text: .}')
+
+          HTTP_STATUS=$(curl \
+            -sS \
+            --max-time 10 \
+            -o slack_response.txt \
+            -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data "${SLACK_PAYLOAD}" \
+            "${SLACK_WEBHOOK_URL}")
+
+          echo "Slack HTTP status: ${HTTP_STATUS}"
+
+          if [ "${HTTP_STATUS}" != "200" ]; then
+            echo "Slack notification failed."
+            cat slack_response.txt
+          else
+            echo "Slack notification sent successfully."
+          fi
+
+          # Playwrightが失敗した場合はCodeBuildも失敗させる
+          exit 1
+        fi
+
+        echo "All footer links are alive."
+
+# CodeBuild のレポート画面でテストケースごとの成否を確認できるようにする
+reports:
+  footer-link-monitor:
+    files:
+      - test-results/junit.xml
+    file-format: JUNITXML

@@ -1,0 +1,12 @@
+{
+  "name": "footer-link-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "里山トラベル予約サイト(元湯陣屋)フッターリンクの死活監視",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.1"
+  }
+}
